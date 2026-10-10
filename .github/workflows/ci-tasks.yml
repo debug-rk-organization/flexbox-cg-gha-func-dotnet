@@ -1,0 +1,187 @@
+name: Reusable Validation and Build
+
+# Provides reusable validation, build, and packaging tasks.
+
+# This workflow is called by the CI entry workflow and returns its outputs.
+on:
+  workflow_call:
+    outputs:
+      semver:
+        description: Calculated semantic version
+        value: ${{ jobs.version.outputs.semver }}
+      deployment_targets:
+        description: JSON array of deployment environments selected for this branch
+        value: ${{ jobs.build.outputs.deployment_targets }}
+
+jobs:
+  # Run repository quality checks independently from version calculation.
+  pre-commit:
+    name: Pre-Commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run pre-commit hooks
+        uses: procter-gamble/da-pp-pda-github-actions/composite/common/pre-commit@2edcb2ed8466782ad3b662b0e3d58c30a744236d # main
+
+  # Full history is required for GitVersion to calculate a reliable version.
+  version:
+    name: Semantic Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      semver: ${{ steps.semver.outputs.semVer }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Determine version
+        id: semver
+        uses: procter-gamble/da-pp-pda-github-actions/composite/common/semver@2edcb2ed8466782ad3b662b0e3d58c30a744236d # main
+
+  # Package only after validation and version calculation succeed.
+  build:
+    name: Build Artifact
+    needs: [pre-commit, version]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      deployment_targets: ${{ steps.targets.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install SonarScanner for .NET
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      # The .NET analyzer instruments MSBuild, so the scan brackets the build.
+      - name: SonarQube begin
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: >
+          dotnet sonarscanner begin
+          /k:"${{ vars.SONAR_PROJECT_KEY }}"
+          /v:"${{ needs.version.outputs.semver }}"
+          /d:sonar.host.url="$SONAR_HOST_URL"
+          /d:sonar.token="$SONAR_TOKEN"
+
+      - name: Build application
+        shell: pwsh
+        run: |
+          dotnet restore
+          dotnet build --configuration Release
+          dotnet publish --configuration Release --output artifact
+
+      # Uncomment to run unit tests and send coverage to SonarQube.
+      # The step must stay between SonarQube begin and end, because the analyzer
+      # only collects results while the build is instrumented.
+      # Add the coverage property to the SonarQube begin step as well:
+      #   /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml"
+      # - name: Run tests
+      #   shell: pwsh
+      #   run: >
+      #     dotnet test --configuration Release --no-build
+      #     --logger "trx;LogFileName=testresults.trx"
+      #     --collect:"XPlat Code Coverage"
+      #     -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
+
+      - name: SonarQube end
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          # ZIP the deployment contents, not the staging directory itself.
+          Push-Location -Path "artifact"
+          zip -r "../app-${{ github.run_id }}-${{ github.sha }}.zip" .
+          Pop-Location
+
+      # The run ID and commit SHA keep both the artifact and ZIP names unique.
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifact-${{ github.run_id }}-${{ github.sha }}
+          path: app-${{ github.run_id }}-${{ github.sha }}.zip
+          retention-days: 14
+
+      # The branch picks the environment; the CICD_DEPLOY_*_ENABLED vars decide if it deploys.
+      - name: Select deployment targets
+        id: targets
+        shell: pwsh
+        env:
+          DEV_ENABLED: ${{ vars.CICD_DEPLOY_DEV_ENABLED }}
+          UAT_ENABLED: ${{ vars.CICD_DEPLOY_UAT_ENABLED }}
+          PROD_ENABLED: ${{ vars.CICD_DEPLOY_PROD_ENABLED }}
+          PROD_DR_ENABLED: ${{ vars.CICD_DEPLOY_PROD_DR_ENABLED }}
+        run: |
+          $targets = [System.Collections.Generic.List[string]]::new()
+
+          switch -Wildcard ($env:GITHUB_REF) {
+            "refs/heads/develop" {
+              if ($env:DEV_ENABLED -eq "true") { $targets.Add("dev") }
+            }
+            "refs/heads/release/*" {
+              if ($env:UAT_ENABLED -eq "true") { $targets.Add("uat") }
+            }
+            "refs/heads/hotfix/*" {
+              if ($env:UAT_ENABLED -eq "true") { $targets.Add("uat") }
+            }
+            "refs/heads/main" {
+              if ($env:PROD_ENABLED -eq "true") { $targets.Add("prod") }
+              if ($env:PROD_DR_ENABLED -eq "true") { $targets.Add("prod_dr") }
+            }
+          }
+
+          $value = ConvertTo-Json -InputObject $targets.ToArray() -Compress
+          "value=$value" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Selected deployment targets: $value"
+
+      - name: Publish CI summary
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          WORKFLOW: ${{ github.workflow }}
+          EVENT: ${{ github.event_name }}
+          INITIATOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          VERSION: ${{ needs.version.outputs.semver }}
+          TARGETS: ${{ steps.targets.outputs.value }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+        run: |
+          $sonarLink = "n/a"
+          if ($env:SONAR_HOST_URL -and $env:SONAR_PROJECT_KEY) {
+            $sonarUrl = "$($env:SONAR_HOST_URL.TrimEnd('/'))/dashboard?id=$($env:SONAR_PROJECT_KEY)"
+            $sonarLink = "[$($env:SONAR_PROJECT_KEY)]($sonarUrl)"
+          }
+
+          $lines = @(
+            "## CI summary"
+            ""
+            "| Field | Value |"
+            "| --- | --- |"
+            "| Workflow | $env:WORKFLOW |"
+            "| Event | $env:EVENT |"
+            "| Initiator | $env:INITIATOR |"
+            "| Branch | $env:REF_NAME |"
+            "| Commit | $env:COMMIT |"
+            "| Version | $env:VERSION |"
+            "| Deployment targets | $env:TARGETS |"
+            "| SonarQube project | $sonarLink |"
+          )
+          ($lines -join "`n") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
